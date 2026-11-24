@@ -19,6 +19,7 @@ import (
 const (
 	slpProtocolVersion = -1 // Protocol-agnostic status query supported by Java 1.7+
 	maxSLPPacketBytes  = 1 << 20
+	maxSLPIOTimeout    = 5 * time.Second
 )
 
 var formattingCodeRegex = regexp.MustCompile(`§[0-9a-fk-orA-FK-OR]`)
@@ -54,11 +55,14 @@ func QueryStatus(ctx context.Context, host string, port int) (ServerStatus, erro
 	if host == "" {
 		return ServerStatus{}, errors.New("minecraft host is empty")
 	}
-	if port <= 0 {
+	if port == 0 {
 		port = 25565
 	}
+	if port < 1 || port > 65535 {
+		return ServerStatus{}, fmt.Errorf("invalid minecraft port: %d", port)
+	}
 
-	dialer := net.Dialer{Timeout: 5 * time.Second}
+	dialer := net.Dialer{Timeout: maxSLPIOTimeout}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -67,11 +71,16 @@ func QueryStatus(ctx context.Context, host string, port int) (ServerStatus, erro
 	}
 	defer conn.Close()
 
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// Cap per-probe I/O deadline and abort immediately on early context cancellation.
+	deadline := time.Now().Add(maxSLPIOTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
+	_ = conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancel()
 
 	// 1. Handshake packet (Packet ID 0x00, Next State = 1 for Status)
 	var handshake bytes.Buffer
@@ -121,7 +130,10 @@ func QueryStatus(ctx context.Context, host string, port int) (ServerStatus, erro
 	pingStart := time.Now()
 	if err := writePacket(conn, ping.Bytes()); err == nil {
 		if pongID, pongPayload, err := readPacket(reader); err == nil && pongID == 0x01 && len(pongPayload) == 8 {
-			latency = time.Since(pingStart)
+			var echoed int64
+			if binary.Read(bytes.NewReader(pongPayload), binary.BigEndian, &echoed) == nil && echoed == nonce {
+				latency = time.Since(pingStart)
+			}
 		}
 	}
 

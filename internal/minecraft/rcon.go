@@ -11,8 +11,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -21,6 +22,9 @@ const (
 	rconPacketAuthResponse int32 = 2
 	rconPacketResponse     int32 = 0
 	maxRCONPacketSize      int32 = 65536
+	// Minecraft Java's RconClient uses a 1460-byte receive buffer (14-byte header + payload).
+	maxRCONCommandBytes = 1400
+	defaultRCONTimeout  = 10 * time.Second
 )
 
 var (
@@ -30,11 +34,11 @@ var (
 	ErrRCONDisabled = errors.New("rcon password not configured")
 )
 
-var rconReqID atomic.Int32
-
 // RCONClient is a short-lived TCP client for Minecraft's Source RCON interface.
 type RCONClient struct {
-	conn net.Conn
+	conn       net.Conn
+	stopCancel func() bool
+	nextID     int32
 }
 
 // DialRCON connects and authenticates to a Minecraft RCON server.
@@ -45,8 +49,11 @@ func DialRCON(ctx context.Context, host string, port int, password string) (*RCO
 	if password == "" {
 		return nil, ErrRCONDisabled
 	}
-	if port <= 0 {
+	if port == 0 {
 		port = 25575
+	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid rcon port: %d", port)
 	}
 
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -59,27 +66,45 @@ func DialRCON(ctx context.Context, host string, port int, password string) (*RCO
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		_ = conn.SetDeadline(time.Now().Add(defaultRCONTimeout))
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
 
-	client := &RCONClient{conn: conn}
+	client := &RCONClient{
+		conn:       conn,
+		stopCancel: stopCancel,
+	}
 	if err := client.authenticate(password); err != nil {
-		_ = conn.Close()
+		_ = client.Close()
 		return nil, err
 	}
 	return client, nil
 }
 
-// Close terminates the underlying TCP connection.
+// Close terminates the underlying TCP connection and detaches context cancellation hooks.
 func (c *RCONClient) Close() error {
+	if c.stopCancel != nil {
+		c.stopCancel()
+		c.stopCancel = nil
+	}
 	if c.conn == nil {
 		return nil
 	}
 	return c.conn.Close()
 }
 
+func (c *RCONClient) allocID() int32 {
+	c.nextID++
+	if c.nextID <= 0 {
+		c.nextID = 1
+	}
+	return c.nextID
+}
+
 func (c *RCONClient) authenticate(password string) error {
-	reqID := nextRCONID()
+	reqID := c.allocID()
 	if err := c.writePacket(reqID, rconPacketAuth, password); err != nil {
 		return fmt.Errorf("send rcon auth: %w", err)
 	}
@@ -102,16 +127,22 @@ func (c *RCONClient) authenticate(password string) error {
 
 // Exec runs a single console command over RCON and returns the server's text response.
 func (c *RCONClient) Exec(command string) (string, error) {
-	reqID := nextRCONID()
+	if len(command) > maxRCONCommandBytes {
+		return "", fmt.Errorf("rcon command length %d exceeds max %d bytes", len(command), maxRCONCommandBytes)
+	}
+	reqID := c.allocID()
 	if err := c.writePacket(reqID, rconPacketExecCommand, command); err != nil {
 		return "", fmt.Errorf("send rcon command: %w", err)
 	}
-	respID, _, body, err := c.readPacket()
+	respID, respType, body, err := c.readPacket()
 	if err != nil {
 		return "", fmt.Errorf("read rcon response: %w", err)
 	}
 	if respID != reqID {
 		return "", fmt.Errorf("rcon response id mismatch: got %d want %d", respID, reqID)
+	}
+	if respType != rconPacketResponse {
+		return "", fmt.Errorf("unexpected rcon response type: %d", respType)
 	}
 	return body, nil
 }
@@ -152,15 +183,6 @@ func (c *RCONClient) readPacket() (int32, int32, string, error) {
 	return id, packetType, body, nil
 }
 
-func nextRCONID() int32 {
-	id := rconReqID.Add(1)
-	if id <= 0 {
-		rconReqID.Store(1)
-		return 1
-	}
-	return id
-}
-
 // Client implements ServerClient against a live Minecraft Java server via SLP and RCON.
 type Client struct {
 	MCPort       int
@@ -172,7 +194,6 @@ type Client struct {
 type ServerClient interface {
 	QueryStatus(ctx context.Context, host string) (ServerStatus, error)
 	SendDiscordChat(ctx context.Context, host, author, message string) error
-	BroadcastNotice(ctx context.Context, host, notice string) error
 	GracefulStop(ctx context.Context, host string) error
 }
 
@@ -196,22 +217,9 @@ func (c *Client) SendDiscordChat(ctx context.Context, host, author, message stri
 	return err
 }
 
-// BroadcastNotice sends a system announcement in gold text to all online Minecraft players.
-func (c *Client) BroadcastNotice(ctx context.Context, host, notice string) error {
-	cmd, err := BuildNoticeTellraw(notice)
-	if err != nil {
-		return err
-	}
-	rcon, err := DialRCON(ctx, host, c.RCONPort, c.RCONPassword)
-	if err != nil {
-		return err
-	}
-	defer rcon.Close()
-	_, err = rcon.Exec(cmd)
-	return err
-}
-
 // GracefulStop flushes world chunks to disk and stops the Minecraft server cleanly over RCON.
+// Some Java/Paper servers immediately close the RCON socket upon receiving "stop", so EOF/reset
+// on the final stop command is treated as a successful shutdown initiation.
 func (c *Client) GracefulStop(ctx context.Context, host string) error {
 	rcon, err := DialRCON(ctx, host, c.RCONPort, c.RCONPassword)
 	if err != nil {
@@ -224,9 +232,19 @@ func (c *Client) GracefulStop(ctx context.Context, host string) error {
 		return fmt.Errorf("rcon save-all flush: %w", err)
 	}
 	if _, err := rcon.Exec("stop"); err != nil {
+		if isExpectedStopDisconnect(err) {
+			return nil
+		}
 		return fmt.Errorf("rcon stop: %w", err)
 	}
 	return nil
+}
+
+func isExpectedStopDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 type tellrawPart struct {
@@ -234,7 +252,8 @@ type tellrawPart struct {
 	Color string `json:"color,omitempty"`
 }
 
-// BuildDiscordTellraw constructs a command-injection-safe tellraw command for Discord messages.
+// BuildDiscordTellraw constructs a command-injection-safe tellraw command for Discord messages
+// guaranteed to fit within Minecraft Java's RCON receive buffer.
 func BuildDiscordTellraw(author, message string) (string, error) {
 	cleanAuthor := sanitizeSingleLine(author, 48)
 	cleanMessage := sanitizeSingleLine(message, 256)
@@ -242,33 +261,45 @@ func BuildDiscordTellraw(author, message string) (string, error) {
 		return "", errors.New("empty chat message")
 	}
 
-	parts := []tellrawPart{
-		{Text: "[Discord] ", Color: "aqua"},
-		{Text: cleanAuthor, Color: "white"},
-		{Text: ": " + cleanMessage, Color: "gray"},
+	const prefix = "tellraw @a "
+	for {
+		parts := []tellrawPart{
+			{Text: "[Discord] ", Color: "aqua"},
+			{Text: cleanAuthor, Color: "white"},
+			{Text: ": " + cleanMessage, Color: "gray"},
+		}
+		raw, err := marshalTellrawJSON(parts)
+		if err != nil {
+			return "", err
+		}
+		cmd := prefix + raw
+		if len(cmd) <= maxRCONCommandBytes {
+			return cmd, nil
+		}
+		// Trim message rune-by-rune until the encoded JSON fits safely under Minecraft's 1460B RCON buffer.
+		runes := []rune(cleanMessage)
+		if len(runes) <= 1 {
+			return "", errors.New("discord tellraw command exceeds rcon buffer limit")
+		}
+		trimTo := len(runes) * 3 / 4
+		if trimTo == len(runes) {
+			trimTo = len(runes) - 1
+		}
+		cleanMessage = strings.TrimSpace(string(runes[:trimTo]))
+		if cleanMessage == "" || !utf8.ValidString(cleanMessage) {
+			return "", errors.New("empty chat message after truncation")
+		}
 	}
-	raw, err := json.Marshal(parts)
-	if err != nil {
-		return "", err
-	}
-	return "tellraw @a " + string(raw), nil
 }
 
-// BuildNoticeTellraw constructs a command-injection-safe tellraw command for server notices.
-func BuildNoticeTellraw(notice string) (string, error) {
-	clean := sanitizeSingleLine(notice, 256)
-	if clean == "" {
-		return "", errors.New("empty notice")
-	}
-	parts := []tellrawPart{
-		{Text: "[Server] ", Color: "gold"},
-		{Text: clean, Color: "yellow"},
-	}
-	raw, err := json.Marshal(parts)
-	if err != nil {
+func marshalTellrawJSON(parts []tellrawPart) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(parts); err != nil {
 		return "", err
 	}
-	return "tellraw @a " + string(raw), nil
+	return strings.TrimSuffix(buf.String(), "\n"), nil
 }
 
 func sanitizeSingleLine(s string, maxRunes int) string {
@@ -278,7 +309,7 @@ func sanitizeSingleLine(s string, maxRunes int) string {
 
 	var out []rune
 	for _, r := range s {
-		if r < 32 || r == 127 {
+		if r < 32 || r == 127 || r == '§' {
 			continue
 		}
 		out = append(out, r)

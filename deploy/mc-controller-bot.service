@@ -18,7 +18,6 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadOnlyPaths=/
 
 [Install]
 WantedBy=multi-user.target

@@ -18,25 +18,41 @@ const (
 	colorGreen  = 0x2ECC71
 	colorYellow = 0xF1C40F
 	colorRed    = 0xE74C3C
+
+	maxDiscordMessageRunes = 1950
+	maxEmbedFieldRunes     = 1000
+	chatRelayQueueCapacity = 64
 )
 
-var slashCommands = []*discordgo.ApplicationCommand{
-	{
-		Name:        "start",
-		Description: "Start the Minecraft GCE VM and announce the new server IP",
-	},
-	{
-		Name:        "stop",
-		Description: "Gracefully save the Minecraft world and power off the GCE VM",
-	},
-	{
-		Name:        "status",
-		Description: "Show GCE VM status, current server IP, MOTD, players, and auto-shutdown timer",
-	},
-	{
-		Name:        "players",
-		Description: "List players currently online on the Minecraft server",
-	},
+var (
+	dmDisabled    = false
+	slashCommands = []*discordgo.ApplicationCommand{
+		{
+			Name:         "start",
+			Description:  "Start the Minecraft GCE VM and announce the new server IP",
+			DMPermission: &dmDisabled,
+		},
+		{
+			Name:         "stop",
+			Description:  "Gracefully save the Minecraft world and power off the GCE VM",
+			DMPermission: &dmDisabled,
+		},
+		{
+			Name:         "status",
+			Description:  "Show GCE VM status, current server IP, MOTD, players, and auto-shutdown timer",
+			DMPermission: &dmDisabled,
+		},
+		{
+			Name:         "players",
+			Description:  "List players currently online on the Minecraft server",
+			DMPermission: &dmDisabled,
+		},
+	}
+)
+
+type chatRelayItem struct {
+	author  string
+	content string
 }
 
 // Bot integrates Discord slash commands, presence updates, announcements, and the chat bridge.
@@ -46,8 +62,15 @@ type Bot struct {
 	ctrl    *controller.Controller
 	logger  *slog.Logger
 
-	mu           sync.Mutex
-	lastPresence string
+	rootCtx   context.Context
+	readyOnce sync.Once
+	readyCh   chan struct{}
+	chatQueue chan chatRelayItem
+	wg        sync.WaitGroup
+
+	presenceMu      sync.Mutex
+	desiredPresence string
+	appliedPresence string
 }
 
 // NewBot initializes a discordgo session configured with the required intents.
@@ -68,9 +91,12 @@ func NewBot(cfg config.BotConfig, logger *slog.Logger) (*Bot, error) {
 	session.Identify.Intents = intents
 
 	b := &Bot{
-		cfg:     cfg,
-		session: session,
-		logger:  logger,
+		cfg:       cfg,
+		session:   session,
+		logger:    logger,
+		rootCtx:   context.Background(),
+		readyCh:   make(chan struct{}),
+		chatQueue: make(chan chatRelayItem, chatRelayQueueCapacity),
 	}
 
 	session.AddHandler(b.handleReady)
@@ -87,16 +113,33 @@ func (b *Bot) SetController(ctrl *controller.Controller) {
 	b.ctrl = ctrl
 }
 
-// Start opens the Discord gateway connection and registers slash commands.
+// Start opens the Discord gateway connection, waits for READY, starts internal workers,
+// and registers slash commands.
 func (b *Bot) Start(ctx context.Context) error {
+	b.rootCtx = ctx
+
 	if err := b.session.Open(); err != nil {
 		return fmt.Errorf("open discord gateway: %w", err)
 	}
 
-	appID := b.session.State.User.ID
-	if _, err := b.session.ApplicationCommandBulkOverwrite(appID, b.cfg.DiscordGuildID, slashCommands); err != nil {
+	// Wait for READY (with fallback to @me REST lookup) so State.User is never nil or racy.
+	appID, botUser, err := b.resolveBotIdentity(ctx)
+	if err != nil {
+		_ = b.session.Close()
+		return fmt.Errorf("resolve discord bot identity: %w", err)
+	}
+
+	if _, err := b.session.ApplicationCommandBulkOverwrite(appID, b.cfg.DiscordGuildID, slashCommands, discordgo.WithContext(ctx)); err != nil {
 		_ = b.session.Close()
 		return fmt.Errorf("register slash commands: %w", err)
+	}
+
+	if b.cfg.ChatChannelID != "" {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.runChatRelayWorker(ctx)
+		}()
 	}
 
 	scope := "global"
@@ -104,62 +147,114 @@ func (b *Bot) Start(ctx context.Context) error {
 		scope = "guild:" + b.cfg.DiscordGuildID
 	}
 	b.logger.Info("discord bot connected and slash commands registered",
-		"user", b.session.State.User.Username,
+		"user", botUser,
 		"scope", scope,
 	)
 
 	return nil
 }
 
-// Close gracefully closes the Discord gateway session.
+func (b *Bot) resolveBotIdentity(ctx context.Context) (string, string, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	select {
+	case <-b.readyCh:
+	case <-waitCtx.Done():
+	}
+
+	if b.session.State != nil {
+		b.session.State.RLock()
+		u := b.session.State.User
+		b.session.State.RUnlock()
+		if u != nil && u.ID != "" {
+			return u.ID, u.Username, nil
+		}
+	}
+
+	u, err := b.session.User("@me", discordgo.WithContext(ctx))
+	if err != nil {
+		return "", "", err
+	}
+	return u.ID, u.Username, nil
+}
+
+// Close closes the Discord gateway so no new interactions arrive and waits for in-flight handlers.
 func (b *Bot) Close() error {
-	return b.session.Close()
+	err := b.session.Close()
+	b.wg.Wait()
+	return err
 }
 
 // Announce posts a status or IP announcement to the configured announcement channel.
-func (b *Bot) Announce(ctx context.Context, message string) {
+func (b *Bot) Announce(ctx context.Context, message string) error {
 	if b.cfg.AnnounceChannelID == "" || strings.TrimSpace(message) == "" {
-		return
+		return nil
 	}
-	_, err := b.session.ChannelMessageSendComplex(b.cfg.AnnounceChannelID, &discordgo.MessageSend{
-		Content:         message,
-		AllowedMentions: &discordgo.MessageAllowedMentions{},
-	})
+	_, err := b.session.ChannelMessageSendComplex(
+		b.cfg.AnnounceChannelID,
+		&discordgo.MessageSend{
+			Content:         truncateRunes(message, maxDiscordMessageRunes),
+			AllowedMentions: &discordgo.MessageAllowedMentions{},
+		},
+		discordgo.WithContext(ctx),
+	)
 	if err != nil {
 		b.logger.Warn("failed to send discord announcement", "channel", b.cfg.AnnounceChannelID, "err", err)
 	}
+	return err
 }
 
-// SetPresence updates the bot's custom Discord activity text (deduplicated to respect rate limits).
+// SetPresence updates the bot's Discord activity text, serialized to avoid out-of-order updates
+// and only caching applied state after UpdateGameStatus succeeds.
 func (b *Bot) SetPresence(text string) {
-	b.mu.Lock()
-	if text == b.lastPresence {
-		b.mu.Unlock()
+	b.presenceMu.Lock()
+	defer b.presenceMu.Unlock()
+
+	b.desiredPresence = text
+	if text == b.appliedPresence {
 		return
 	}
-	b.lastPresence = text
-	b.mu.Unlock()
-
-	if b.session.State == nil || b.session.State.User == nil {
+	if !b.isGatewayReady() {
 		return
 	}
 	if err := b.session.UpdateGameStatus(0, text); err != nil {
 		b.logger.Debug("failed to update discord presence", "err", err)
+		return
 	}
+	b.appliedPresence = text
+}
+
+func (b *Bot) isGatewayReady() bool {
+	if b.session.State == nil {
+		return false
+	}
+	b.session.State.RLock()
+	ready := b.session.State.User != nil
+	b.session.State.RUnlock()
+	return ready
 }
 
 func (b *Bot) handleReady(s *discordgo.Session, r *discordgo.Ready) {
+	b.readyOnce.Do(func() {
+		close(b.readyCh)
+	})
 	b.logger.Info("discord gateway ready", "bot_user", r.User.Username)
-	b.mu.Lock()
-	presence := b.lastPresence
-	b.mu.Unlock()
-	if presence != "" {
-		_ = s.UpdateGameStatus(0, presence)
+
+	b.presenceMu.Lock()
+	defer b.presenceMu.Unlock()
+	if b.desiredPresence != "" {
+		if err := s.UpdateGameStatus(0, b.desiredPresence); err == nil {
+			b.appliedPresence = b.desiredPresence
+		}
 	}
 }
 
 func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand || b.ctrl == nil {
+		return
+	}
+	if b.rootCtx.Err() != nil {
 		return
 	}
 
@@ -170,12 +265,14 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	// Acknowledge immediately so long GCE/RCON operations never hit Discord's 3-second limit.
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	}); err != nil {
+	}, discordgo.WithContext(b.rootCtx)); err != nil {
 		b.logger.Warn("failed to defer slash command", "command", name, "err", err)
 		return
 	}
 
+	b.wg.Add(1)
 	go func() {
+		defer b.wg.Done()
 		switch name {
 		case "start":
 			b.cmdStart(s, i, requester)
@@ -186,76 +283,84 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		case "players":
 			b.cmdPlayers(s, i)
 		default:
-			b.editReply(s, i, "Unknown command.")
+			b.editReply(b.rootCtx, s, i, "Unknown command.")
 		}
 	}()
 }
 
 func (b *Bot) cmdStart(s *discordgo.Session, i *discordgo.InteractionCreate, requester string) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.BootTimeout+30*time.Second)
+	bootTimeout := b.cfg.BootTimeout
+	if bootTimeout <= 0 {
+		bootTimeout = 3 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(b.rootCtx, bootTimeout+30*time.Second)
 	defer cancel()
 
 	info, err := b.ctrl.StartServer(ctx, requester)
 	if err != nil {
-		b.editReply(s, i, fmt.Sprintf("Failed to start Minecraft VM: `%v`", err))
+		b.editReply(ctx, s, i, fmt.Sprintf("Failed to start Minecraft VM: `%v`", err))
 		return
 	}
 
-	addr := fmt.Sprintf("%s:%d", info.ExternalIP, b.cfg.MCPort)
-	b.editReply(s, i, fmt.Sprintf("Minecraft VM is **RUNNING**!\nServer IP: `%s`\n*(If Minecraft is still starting up, a ready alert will appear shortly.)*", addr))
+	if info.ExternalIP != "" {
+		addr := formatServerAddr(info.ExternalIP, b.cfg.MCPort)
+		b.editReply(ctx, s, i, fmt.Sprintf("Minecraft VM is **RUNNING**!\nServer IP: `%s`\n*(If Minecraft is still starting up, a ready alert will appear shortly.)*", addr))
+		return
+	}
+	b.editReply(ctx, s, i, "Minecraft VM is **RUNNING**, waiting for external IP assignment.")
 }
 
 func (b *Bot) cmdStop(s *discordgo.Session, i *discordgo.InteractionCreate, requester string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(b.rootCtx, 3*time.Minute)
 	defer cancel()
 
 	err := b.ctrl.StopServer(ctx, "requested by "+requester)
 	if err != nil {
-		b.editReply(s, i, fmt.Sprintf("Failed to stop Minecraft VM: `%v`", err))
+		b.editReply(ctx, s, i, fmt.Sprintf("Failed to stop Minecraft VM: `%v`", err))
 		return
 	}
-	b.editReply(s, i, "Minecraft world saved and GCE VM has been **STOPPED**.")
+	b.editReply(ctx, s, i, "Minecraft world saved and GCE VM has been **STOPPED**.")
 }
 
 func (b *Bot) cmdStatus(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(b.rootCtx, 20*time.Second)
 	defer cancel()
 
 	snap, err := b.ctrl.GetStatus(ctx)
 	if err != nil {
-		b.editReply(s, i, fmt.Sprintf("Failed to fetch server status: `%v`", err))
+		b.editReply(ctx, s, i, fmt.Sprintf("Failed to fetch server status: `%v`", err))
 		return
 	}
 
 	embed := buildStatusEmbed(snap, b.cfg.MCInstanceName)
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Embeds: &[]*discordgo.MessageEmbed{embed},
-	})
+	}, discordgo.WithContext(ctx))
 	if err != nil {
 		b.logger.Warn("failed to edit /status response", "err", err)
 	}
 }
 
 func (b *Bot) cmdPlayers(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(b.rootCtx, 15*time.Second)
 	defer cancel()
 
 	snap, err := b.ctrl.GetStatus(ctx)
 	if err != nil {
-		b.editReply(s, i, fmt.Sprintf("Failed to query server: `%v`", err))
+		b.editReply(ctx, s, i, fmt.Sprintf("Failed to query server: `%v`", err))
 		return
 	}
 
 	if snap.Phase == controller.PhaseOffline {
-		b.editReply(s, i, "The Minecraft server is currently **OFFLINE**. Use `/start` to boot it up.")
+		b.editReply(ctx, s, i, "The Minecraft server is currently **OFFLINE**. Use `/start` to boot it up.")
 		return
 	}
 	if snap.MC == nil {
-		b.editReply(s, i, fmt.Sprintf("The VM is `%s`, but the Minecraft server is still starting up (not responding to pings yet).", snap.VM.Status))
+		b.editReply(ctx, s, i, fmt.Sprintf("The VM is `%s`, but the Minecraft server is still starting up (not responding to pings yet).", snap.VM.Status))
 		return
 	}
 	if snap.MC.OnlinePlayers == 0 {
-		b.editReply(s, i, fmt.Sprintf("**0/%d** players online right now.", snap.MC.MaxPlayers))
+		b.editReply(ctx, s, i, fmt.Sprintf("**0/%d** players online right now.", snap.MC.MaxPlayers))
 		return
 	}
 
@@ -265,14 +370,15 @@ func (b *Bot) cmdPlayers(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	} else {
 		msg = fmt.Sprintf("**%d/%d** players online *(server hides player sample list)*.", snap.MC.OnlinePlayers, snap.MC.MaxPlayers)
 	}
-	b.editReply(s, i, msg)
+	b.editReply(ctx, s, i, msg)
 }
 
-func (b *Bot) editReply(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+func (b *Bot) editReply(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	safe := truncateRunes(content, maxDiscordMessageRunes)
 	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content:         &content,
+		Content:         &safe,
 		AllowedMentions: &discordgo.MessageAllowedMentions{},
-	})
+	}, discordgo.WithContext(ctx))
 	if err != nil {
 		b.logger.Warn("failed to edit interaction response", "err", err)
 	}
@@ -295,7 +401,7 @@ func buildStatusEmbed(snap controller.Snapshot, instanceName string) *discordgo.
 	fields := []*discordgo.MessageEmbedField{
 		{
 			Name:   "GCE VM",
-			Value:  fmt.Sprintf("`%s` (%s)", instanceName, snap.VM.Status),
+			Value:  truncateRunes(fmt.Sprintf("`%s` (%s)", instanceName, snap.VM.Status), maxEmbedFieldRunes),
 			Inline: true,
 		},
 	}
@@ -303,7 +409,7 @@ func buildStatusEmbed(snap controller.Snapshot, instanceName string) *discordgo.
 	if snap.VM.ExternalIP != "" {
 		fields = append(fields, &discordgo.MessageEmbedField{
 			Name:   "Server IP",
-			Value:  fmt.Sprintf("`%s:%d`", snap.VM.ExternalIP, snap.MCPort),
+			Value:  fmt.Sprintf("`%s`", formatServerAddr(snap.VM.ExternalIP, snap.MCPort)),
 			Inline: true,
 		})
 	} else {
@@ -322,12 +428,12 @@ func buildStatusEmbed(snap controller.Snapshot, instanceName string) *discordgo.
 		fields = append(fields,
 			&discordgo.MessageEmbedField{
 				Name:   "Players",
-				Value:  playerValue,
+				Value:  truncateRunes(playerValue, maxEmbedFieldRunes),
 				Inline: true,
 			},
 			&discordgo.MessageEmbedField{
 				Name:   "Version",
-				Value:  fallbackText(snap.MC.Version, "Unknown"),
+				Value:  truncateRunes(fallbackText(snap.MC.Version, "Unknown"), maxEmbedFieldRunes),
 				Inline: true,
 			},
 			&discordgo.MessageEmbedField{
@@ -337,7 +443,7 @@ func buildStatusEmbed(snap controller.Snapshot, instanceName string) *discordgo.
 			},
 			&discordgo.MessageEmbedField{
 				Name:   "MOTD",
-				Value:  fallbackText(snap.MC.MOTD, "—"),
+				Value:  truncateRunes(fallbackText(snap.MC.MOTD, "—"), maxEmbedFieldRunes),
 				Inline: false,
 			},
 		)
@@ -369,6 +475,24 @@ func buildStatusEmbed(snap controller.Snapshot, instanceName string) *discordgo.
 		Fields:    fields,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+func formatServerAddr(ip string, port int) string {
+	if port <= 0 {
+		port = 25565
+	}
+	return fmt.Sprintf("%s:%d", ip, port)
+}
+
+func truncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max <= 1 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-1]) + "…"
 }
 
 func interactionUser(i *discordgo.InteractionCreate) string {

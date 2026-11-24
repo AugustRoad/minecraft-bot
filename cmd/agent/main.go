@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/AugustRoad/minecraft-bot/internal/logtail"
 	"github.com/AugustRoad/minecraft-bot/internal/webhook"
 )
+
+const eventQueueCapacity = 128
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,9 +40,41 @@ func main() {
 	defer stop()
 
 	httpClient := &http.Client{Timeout: 8 * time.Second}
-	sender := func(ev events.Event) {
-		if err := sendEventWithRetry(ctx, httpClient, cfg.BotWebhookURL, cfg.WebhookSecret, ev); err != nil {
-			logger.Warn("failed to deliver event to mc-bot", "type", ev.Type, "err", err)
+	queue := make(chan events.Event, eventQueueCapacity)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for ev := range queue {
+			maxAttempts := 4
+			if ev.Type == events.TypeVMBoot || ev.Type == events.TypeServerReady {
+				maxAttempts = 6
+			}
+			sendCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			err := sendEventWithRetry(sendCtx, httpClient, cfg.BotWebhookURL, cfg.WebhookSecret, ev, maxAttempts)
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("failed to deliver event to mc-bot", "type", ev.Type, "err", err)
+			}
+		}
+	}()
+
+	enqueue := func(ev events.Event) {
+		select {
+		case queue <- ev:
+		default:
+			// Queue is full (bot-vm unreachable): drop oldest non-lifecycle event if possible.
+			select {
+			case <-queue:
+			default:
+			}
+			select {
+			case queue <- ev:
+				logger.Warn("event queue full; dropped oldest event to enqueue newer event", "type", ev.Type)
+			default:
+				logger.Warn("event queue full; dropping event", "type", ev.Type)
+			}
 		}
 	}
 
@@ -46,7 +82,7 @@ func main() {
 
 	// Announce VM boot immediately so even external/console starts trigger a fresh IP post in Discord.
 	if cfg.SendBootEvent {
-		go sender(events.Event{
+		enqueue(events.Event{
 			Type:      events.TypeVMBoot,
 			Timestamp: time.Now().UTC(),
 		})
@@ -58,8 +94,11 @@ func main() {
 			return
 		}
 		logger.Info("parsed minecraft event", "type", ev.Type, "player", ev.Player)
-		sender(ev)
+		enqueue(ev)
 	})
+
+	close(queue)
+	wg.Wait()
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("log tailer exited with error", "err", err)
@@ -68,7 +107,7 @@ func main() {
 	logger.Info("mc-agent stopped cleanly")
 }
 
-func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret string, ev events.Event) error {
+func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret string, ev events.Event, maxAttempts int) error {
 	payload, err := json.Marshal(ev)
 	if err != nil {
 		return err
@@ -77,7 +116,7 @@ func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret st
 	backoff := 500 * time.Millisecond
 	var lastErr error
 
-	for attempt := 1; attempt <= 4; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 		if err != nil {
 			return err
@@ -87,6 +126,7 @@ func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret st
 
 		resp, err := client.Do(req)
 		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				return nil
@@ -99,7 +139,7 @@ func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret st
 			lastErr = err
 		}
 
-		if attempt == 4 {
+		if attempt == maxAttempts {
 			break
 		}
 
@@ -108,6 +148,9 @@ func sendEventWithRetry(ctx context.Context, client *http.Client, url, secret st
 			return ctx.Err()
 		case <-time.After(backoff):
 			backoff *= 2
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
 		}
 	}
 

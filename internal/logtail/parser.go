@@ -9,13 +9,16 @@ import (
 )
 
 var (
-	// Matches Vanilla/Paper/Fabric/Forge log prefixes:
+	// Matches Vanilla/Paper/Purpur/Fabric/Forge log prefixes:
 	//   [12:34:56] [Server thread/INFO]: <message>
 	//   [12:34:56] [Async Chat Thread - #0/INFO]: <message>
 	//   [12:34:56] [Server thread/INFO] [minecraft/DedicatedServer]: <message>
-	logPrefixRe = regexp.MustCompile(`^\[[^\]]+\]\s+\[[^\]]+/(?:INFO|WARN)\](?:\s+\[[^\]]+\])?:\s+(.*)$`)
+	//   [12:34:56 INFO]: <message>
+	logPrefixRe = regexp.MustCompile(`^\[[^\]]+\](?:\s+\[[^\]]+/(?:INFO|WARN)\](?:\s+\[[^\]]+\])?|(?:\s+(?:INFO|WARN))):\s+(.*)$`)
+	// Matches single-bracket Paper/Purpur style: [12:34:56 INFO]: <message>
+	singleBracketPrefixRe = regexp.MustCompile(`^\[[^\]]+\s+(?:INFO|WARN)\]:\s+(.*)$`)
 
-	doneRe       = regexp.MustCompile(`^Done \([0-9.]+s\)!`)
+	doneRe       = regexp.MustCompile(`^Done \([0-9.,]+s\)!`)
 	stoppingRe   = regexp.MustCompile(`^Stopping the server$`)
 	joinRe       = regexp.MustCompile(`^([A-Za-z0-9_]{3,16}) joined the game$`)
 	leaveRe      = regexp.MustCompile(`^([A-Za-z0-9_]{3,16}) left the game$`)
@@ -72,11 +75,14 @@ func ParseLine(line string, now time.Time) (events.Event, bool) {
 		return events.Event{}, false
 	}
 
-	m := logPrefixRe.FindStringSubmatch(line)
-	if m == nil {
+	var body string
+	if m := logPrefixRe.FindStringSubmatch(line); m != nil {
+		body = strings.TrimSpace(m[1])
+	} else if m := singleBracketPrefixRe.FindStringSubmatch(line); m != nil {
+		body = strings.TrimSpace(m[1])
+	} else {
 		return events.Event{}, false
 	}
-	body := strings.TrimSpace(m[1])
 	if body == "" {
 		return events.Event{}, false
 	}

@@ -62,9 +62,9 @@ func main() {
 		logger.Error("failed to start Discord bot", "err", err)
 		os.Exit(1)
 	}
-	defer bot.Close()
 
-	webhookServer := webhook.NewServer(cfg.WebhookListenAddr, cfg.WebhookSecret, ctrl.HandleAgentEvent, logger)
+	// EnqueueAgentEvent returns immediately so webhook HTTP responses never block on Discord REST.
+	webhookServer := webhook.NewServer(cfg.WebhookListenAddr, cfg.WebhookSecret, ctrl.EnqueueAgentEvent, logger)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -92,6 +92,14 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("shutting down mc-bot...")
+
+	// 1. Close Discord gateway and wait for in-flight slash command / chat workers first
+	//    while gceClient is still open.
+	if err := bot.Close(); err != nil {
+		logger.Warn("error closing discord bot", "err", err)
+	}
+	// 2. Wait for webhook HTTP server and controller loop to finish draining.
 	wg.Wait()
+	// 3. gceClient.Close() runs via defer after all users of gceClient have exited.
 	logger.Info("mc-bot stopped cleanly")
 }

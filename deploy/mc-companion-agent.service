@@ -2,6 +2,8 @@
 Description=Minecraft Companion Log Agent (mc-agent)
 After=network-online.target
 Wants=network-online.target
+# Start before your Minecraft server unit (rename if your unit differs) so boot logs are never missed.
+Before=minecraft.service
 
 [Service]
 Type=simple

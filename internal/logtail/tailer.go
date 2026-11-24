@@ -11,9 +11,11 @@ import (
 	"time"
 )
 
+const maxLineBytes = 64 * 1024
+
 // TailFile continuously tails path, emitting each complete line to onLine.
-// It gracefully handles files that do not yet exist, truncation, and Minecraft log rotation
-// (when latest.log is archived and recreated on server restart).
+// It gracefully handles files that do not yet exist, truncation, line-length caps,
+// and Minecraft log rotation (draining remaining bytes from the rotated FD before switching).
 func TailFile(ctx context.Context, path string, pollInterval time.Duration, logger *slog.Logger, onLine func(string)) error {
 	if pollInterval <= 0 {
 		pollInterval = 250 * time.Millisecond
@@ -28,7 +30,7 @@ func TailFile(ctx context.Context, path string, pollInterval time.Duration, logg
 		reader       *bufio.Reader
 		offset       int64
 		partial      strings.Builder
-		initialCheck = true
+		droppingLine bool
 	)
 
 	closeCurrent := func() {
@@ -39,6 +41,7 @@ func TailFile(ctx context.Context, path string, pollInterval time.Duration, logg
 			reader = nil
 			offset = 0
 			partial.Reset()
+			droppingLine = false
 		}
 	}
 	defer closeCurrent()
@@ -68,15 +71,54 @@ func TailFile(ctx context.Context, path string, pollInterval time.Duration, logg
 		fileInfo = fi
 		reader = bufio.NewReader(f)
 		partial.Reset()
+		droppingLine = false
 		logger.Info("attached to minecraft log", "path", path, "offset", offset)
 		return true
 	}
 
+	drainLines := func() bool {
+		if file == nil {
+			return false
+		}
+		for {
+			chunk, err := reader.ReadString('\n')
+			if len(chunk) > 0 {
+				offset += int64(len(chunk))
+				hasNewline := strings.HasSuffix(chunk, "\n")
+
+				if !droppingLine {
+					if partial.Len()+len(chunk) > maxLineBytes {
+						droppingLine = true
+						partial.Reset()
+					} else {
+						partial.WriteString(chunk)
+					}
+				}
+
+				if hasNewline {
+					if !droppingLine {
+						full := strings.TrimRight(partial.String(), "\r\n")
+						partial.Reset()
+						onLine(full)
+					} else {
+						droppingLine = false
+					}
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return true
+				}
+				logger.Warn("error reading minecraft log; reopening", "err", err)
+				closeCurrent()
+				return false
+			}
+		}
+	}
+
 	// If latest.log already exists at agent startup, start from EOF to avoid replaying old logs.
 	// If it does not exist yet (e.g., MC server is still booting), wait and read from byte 0 when created.
-	if openFile(true) {
-		initialCheck = false
-	}
+	openFile(true)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -84,55 +126,38 @@ func TailFile(ctx context.Context, path string, pollInterval time.Duration, logg
 	for {
 		if file == nil {
 			if openFile(false) {
-				initialCheck = false
+				drainLines()
 			}
 		} else {
-			for {
-				line, err := reader.ReadString('\n')
-				if len(line) > 0 {
-					offset += int64(len(line))
-					if strings.HasSuffix(line, "\n") {
-						full := partial.String() + strings.TrimRight(line, "\r\n")
-						partial.Reset()
-						onLine(full)
-					} else {
-						partial.WriteString(line)
-					}
-				}
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						break
-					}
-					logger.Warn("error reading minecraft log; reopening", "err", err)
-					closeCurrent()
-					break
-				}
-			}
+			drainLines()
 
 			// Detect log rotation or truncation
 			if file != nil {
 				stat, err := os.Stat(path)
 				if err != nil {
 					if errors.Is(err, os.ErrNotExist) {
+						// Drain any final lines written to the unlinked FD before closing.
+						drainLines()
 						closeCurrent()
 					}
 				} else if !os.SameFile(fileInfo, stat) {
-					logger.Info("minecraft log rotated; switching to new file", "path", path)
+					logger.Info("minecraft log rotated; draining and switching to new file", "path", path)
+					drainLines()
 					closeCurrent()
-					openFile(false)
+					if openFile(false) {
+						drainLines()
+					}
 				} else if stat.Size() < offset {
 					logger.Info("minecraft log truncated; rewinding to start", "path", path)
 					if _, seekErr := file.Seek(0, io.SeekStart); seekErr == nil {
 						offset = 0
 						reader.Reset(file)
 						partial.Reset()
+						droppingLine = false
+						drainLines()
 					}
 				}
 			}
-		}
-
-		if initialCheck {
-			initialCheck = false
 		}
 
 		select {

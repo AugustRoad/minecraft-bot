@@ -10,7 +10,8 @@ BOT_VM="${BOT_VM:-bot-vm}"
 MC_VM="${MC_VM:-mc-vm}"
 SA_NAME="${SA_NAME:-mc-discord-bot}"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-ROLE_ID="mcVmController"
+INSTANCE_ROLE_ID="mcVmInstanceController"
+OPS_ROLE_ID="mcZoneOperationsReader"
 
 echo "==> Setting project to ${PROJECT_ID}"
 gcloud config set project "${PROJECT_ID}"
@@ -19,19 +20,33 @@ echo "==> Creating dedicated Service Account for ${BOT_VM}"
 gcloud iam service-accounts create "${SA_NAME}" \
   --display-name="Minecraft Discord Controller Bot" || true
 
-echo "==> Creating least-privilege custom IAM role (${ROLE_ID})"
-gcloud iam roles create "${ROLE_ID}" \
+echo "==> Creating least-privilege custom IAM role for VM control (${INSTANCE_ROLE_ID})"
+gcloud iam roles create "${INSTANCE_ROLE_ID}" \
   --project="${PROJECT_ID}" \
-  --title="Minecraft VM Controller" \
-  --description="Allows reading, starting, and stopping a GCE VM" \
-  --permissions="compute.instances.get,compute.instances.start,compute.instances.stop,compute.zoneOperations.get" \
+  --title="Minecraft VM Instance Controller" \
+  --description="Allows reading, starting, and stopping a specific GCE VM instance" \
+  --permissions="compute.instances.get,compute.instances.start,compute.instances.stop" \
   --stage="GA" || true
 
-echo "==> Binding custom role scoped specifically to ${MC_VM}"
+echo "==> Creating minimal custom IAM role for waiting on zone operations (${OPS_ROLE_ID})"
+gcloud iam roles create "${OPS_ROLE_ID}" \
+  --project="${PROJECT_ID}" \
+  --title="Minecraft Zone Operations Reader" \
+  --description="Allows polling Compute Engine zone operation completion" \
+  --permissions="compute.zoneOperations.get" \
+  --stage="GA" || true
+
+echo "==> Binding VM control role directly on ${MC_VM}"
+gcloud compute instances add-iam-policy-binding "${MC_VM}" \
+  --zone="${ZONE}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="projects/${PROJECT_ID}/roles/${INSTANCE_ROLE_ID}"
+
+echo "==> Binding zone operations read role at the project level (required by op.Wait)"
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${SA_EMAIL}" \
-  --role="projects/${PROJECT_ID}/roles/${ROLE_ID}" \
-  --condition="expression=resource.name.endsWith('/zones/${ZONE}/instances/${MC_VM}') || resource.type == 'compute.googleapis.com/Operation',title=only-mc-vm,description=Restrict bot control to ${MC_VM}"
+  --role="projects/${PROJECT_ID}/roles/${OPS_ROLE_ID}" \
+  --condition=None
 
 echo "==> Adding VPC network tags to ${BOT_VM} and ${MC_VM}"
 gcloud compute instances add-tags "${BOT_VM}" --zone="${ZONE}" --tags=discord-bot

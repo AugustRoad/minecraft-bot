@@ -31,6 +31,7 @@ IDLE_WARNING_BEFORE=3m
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
 	}
 	// Pre-set an env var to verify LoadDotEnv does not override existing environment values.
 	t.Setenv("GCP_ZONE", "europe-west1-b")

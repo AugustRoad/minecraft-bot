@@ -24,15 +24,15 @@ func (b *Bot) SendGameEvent(ctx context.Context, ev events.Event) {
 	var text string
 	switch ev.Type {
 	case events.TypePlayerJoin:
-		text = fmt.Sprintf("➕ **%s** joined the game", escapeDiscord(ev.Player))
+		text = fmt.Sprintf("➕ **%s** joined the game", escapeDiscordMarkdown(ev.Player))
 	case events.TypePlayerLeave:
-		text = fmt.Sprintf("➖ **%s** left the game", escapeDiscord(ev.Player))
+		text = fmt.Sprintf("➖ **%s** left the game", escapeDiscordMarkdown(ev.Player))
 	case events.TypeChat:
-		text = fmt.Sprintf("💬 **%s**: %s", escapeDiscord(ev.Player), escapeDiscord(ev.Message))
+		text = fmt.Sprintf("💬 **%s**: %s", escapeDiscordMarkdown(ev.Player), escapeDiscordMentions(ev.Message))
 	case events.TypeAdvancement:
-		text = fmt.Sprintf("🏆 %s", escapeDiscord(ev.Message))
+		text = fmt.Sprintf("🏆 %s", escapeDiscordMentions(ev.Message))
 	case events.TypeDeath:
-		text = fmt.Sprintf("💀 %s", escapeDiscord(ev.Message))
+		text = fmt.Sprintf("💀 %s", escapeDiscordMentions(ev.Message))
 	case events.TypeServerStopping:
 		text = "🛑 Minecraft server is shutting down..."
 	default:
@@ -40,16 +40,20 @@ func (b *Bot) SendGameEvent(ctx context.Context, ev events.Event) {
 	}
 
 	// Empty AllowedMentions prevents in-game players from triggering @everyone/@here/role pings.
-	_, err := b.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
-		Content:         text,
-		AllowedMentions: &discordgo.MessageAllowedMentions{},
-	})
+	_, err := b.session.ChannelMessageSendComplex(
+		channelID,
+		&discordgo.MessageSend{
+			Content:         truncateRunes(text, maxDiscordMessageRunes),
+			AllowedMentions: &discordgo.MessageAllowedMentions{},
+		},
+		discordgo.WithContext(ctx),
+	)
 	if err != nil {
 		b.logger.Warn("failed to forward game event to discord", "type", ev.Type, "err", err)
 	}
 }
 
-// handleMessageCreate relays messages written in the live chat bridge channel into Minecraft via RCON.
+// handleMessageCreate enqueues messages written in the live chat bridge channel for ordered RCON delivery.
 func (b *Bot) handleMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if b.ctrl == nil || b.cfg.ChatChannelID == "" {
 		return
@@ -76,15 +80,41 @@ func (b *Bot) handleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		author = m.Author.GlobalName
 	}
 
-	go func() {
-		if err := b.ctrl.RelayDiscordChat(context.Background(), author, content); err != nil {
-			b.logger.Debug("could not relay discord chat to minecraft", "author", author, "err", err)
-		}
-	}()
+	select {
+	case b.chatQueue <- chatRelayItem{author: author, content: content}:
+	default:
+		b.logger.Warn("discord chat relay queue full; dropping message", "author", author)
+	}
 }
 
-func escapeDiscord(s string) string {
+func (b *Bot) runChatRelayWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-b.chatQueue:
+			if err := b.ctrl.RelayDiscordChat(ctx, item.author, item.content); err != nil {
+				b.logger.Debug("could not relay discord chat to minecraft", "author", item.author, "err", err)
+			}
+		}
+	}
+}
+
+func escapeDiscordMentions(s string) string {
 	r := strings.NewReplacer(
+		"@everyone", "@\u200beveryone",
+		"@here", "@\u200bhere",
+	)
+	return r.Replace(s)
+}
+
+func escapeDiscordMarkdown(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`_`, `\_`,
+		`*`, `\*`,
+		`~`, `\~`,
+		"`", "\\`",
 		"@everyone", "@\u200beveryone",
 		"@here", "@\u200bhere",
 	)

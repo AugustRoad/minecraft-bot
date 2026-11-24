@@ -89,8 +89,6 @@ func (f *fakeMC) SendDiscordChat(ctx context.Context, host, author, message stri
 	return nil
 }
 
-func (f *fakeMC) BroadcastNotice(ctx context.Context, host, notice string) error { return nil }
-
 func (f *fakeMC) GracefulStop(ctx context.Context, host string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -106,10 +104,11 @@ type fakeNotifier struct {
 	lastPresence  string
 }
 
-func (n *fakeNotifier) Announce(ctx context.Context, msg string) {
+func (n *fakeNotifier) Announce(ctx context.Context, msg string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.announcements = append(n.announcements, msg)
+	return nil
 }
 
 func (n *fakeNotifier) SendGameEvent(ctx context.Context, ev events.Event) {

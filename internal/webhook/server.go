@@ -92,7 +92,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	provided := []byte(r.Header.Get(HeaderSecret))
-	if len(provided) != len(s.secret) || subtle.ConstantTimeCompare(provided, s.secret) != 1 {
+	if len(s.secret) == 0 || len(provided) != len(s.secret) || subtle.ConstantTimeCompare(provided, s.secret) != 1 {
 		s.logger.Warn("rejected unauthorized webhook request", "remote", r.RemoteAddr)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
