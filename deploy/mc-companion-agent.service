@@ -1,0 +1,22 @@
+[Unit]
+Description=Minecraft Companion Log Agent (mc-agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the same user that owns the Minecraft server logs (or a user in its group)
+User=minecraft
+Group=minecraft
+EnvironmentFile=/etc/mc-agent/agent.env
+ExecStart=/usr/local/bin/mc-agent
+Restart=always
+RestartSec=3
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
