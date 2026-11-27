@@ -1,0 +1,9 @@
+[Unit]
+Description=Minecraft World RCON-Safe Backup
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/mc-backup.py
+Nice=10
+IOSchedulingClass=idle

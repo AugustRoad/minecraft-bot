@@ -314,3 +314,40 @@ gcloud compute ssh mc-vm \
   --zone=us-central1-a \
   --command 'sudo systemctl stop mc-companion-agent && sudo install -m 0755 /tmp/mc-agent /usr/local/bin/mc-agent && sudo systemctl start mc-companion-agent && sudo systemctl status mc-companion-agent --no-pager'
 ```
+
+---
+
+### 5. Automatic 15-Minute World Backups (Keep Latest 2)
+
+[`deploy/mc-backup.py`](deploy/mc-backup.py), [`deploy/mc-backup.service`](deploy/mc-backup.service), and [`deploy/mc-backup.timer`](deploy/mc-backup.timer) run an RCON-safe backup (`save-off` -> `save-all flush` -> `tar` -> `save-on`) every 15 minutes while `mc-vm` is running and automatically keep only the **2 newest** backups in `/opt/mc-backups`.
+
+#### Install from `[GCP Cloud Shell]`
+```bash
+cd ~/minecraft-bot
+gcloud compute scp deploy/mc-backup.py deploy/mc-backup.service deploy/mc-backup.timer mc-vm:/tmp/ \
+  --project=YOUR_PROJECT_ID \
+  --zone=us-central1-a
+
+gcloud compute ssh mc-vm \
+  --project=YOUR_PROJECT_ID \
+  --zone=us-central1-a \
+  --command '
+    sudo install -m 0755 /tmp/mc-backup.py /usr/local/bin/mc-backup.py &&
+    sudo install -m 0644 /tmp/mc-backup.service /etc/systemd/system/mc-backup.service &&
+    sudo install -m 0644 /tmp/mc-backup.timer /etc/systemd/system/mc-backup.timer &&
+    sudo systemctl daemon-reload &&
+    sudo systemctl enable --now mc-backup.timer &&
+    sudo systemctl start mc-backup.service &&
+    ls -lh /opt/mc-backups
+  '
+```
+
+#### Restore a Backup `[SSH on mc-vm]`
+```bash
+ls -lh /opt/mc-backups
+sudo systemctl stop minecraft
+sudo rm -rf /opt/minecraft/world
+sudo tar -xzf /opt/mc-backups/world-YYYY-MM-DD-HHMMSS.tar.gz -C /opt/minecraft
+sudo chown -R minecraft:minecraft /opt/minecraft/world
+sudo systemctl start minecraft
+```
