@@ -26,6 +26,7 @@ const (
 
 var (
 	dmDisabled    = false
+	adminPerm     = int64(discordgo.PermissionAdministrator)
 	slashCommands = []*discordgo.ApplicationCommand{
 		{
 			Name:         "start",
@@ -46,6 +47,20 @@ var (
 			Name:         "players",
 			Description:  "List players currently online on the Minecraft server",
 			DMPermission: &dmDisabled,
+		},
+		{
+			Name:                     "cmd",
+			Description:              "Run a Minecraft server console command over RCON (Admins only)",
+			DMPermission:             &dmDisabled,
+			DefaultMemberPermissions: &adminPerm,
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "command",
+					Description: "Console command to run (e.g., op Steve, list, gamerule keepInventory true)",
+					Required:    true,
+				},
+			},
 		},
 	}
 )
@@ -282,10 +297,49 @@ func (b *Bot) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 			b.cmdStatus(s, i)
 		case "players":
 			b.cmdPlayers(s, i)
+		case "cmd":
+			b.cmdExec(s, i, requester)
 		default:
 			b.editReply(b.rootCtx, s, i, "Unknown command.")
 		}
 	}()
+}
+
+func (b *Bot) cmdExec(s *discordgo.Session, i *discordgo.InteractionCreate, requester string) {
+	ctx, cancel := context.WithTimeout(b.rootCtx, 20*time.Second)
+	defer cancel()
+
+	if i.Member == nil || (i.Member.Permissions&discordgo.PermissionAdministrator) == 0 {
+		b.editReply(ctx, s, i, "You need **Administrator** permission to run server console commands.")
+		return
+	}
+
+	var command string
+	for _, opt := range i.ApplicationCommandData().Options {
+		if opt.Name == "command" {
+			command = strings.TrimSpace(opt.StringValue())
+			break
+		}
+	}
+	if command == "" {
+		b.editReply(ctx, s, i, "Please provide a console command to run.")
+		return
+	}
+
+	b.logger.Info("executing rcon console command", "user", requester, "command", command)
+
+	out, err := b.ctrl.RunCommand(ctx, command)
+	if err != nil {
+		b.editReply(ctx, s, i, fmt.Sprintf("Failed to run `%s`: `%v`", command, err))
+		return
+	}
+
+	if out == "" {
+		b.editReply(ctx, s, i, fmt.Sprintf("Executed `%s` *(no output)*.", command))
+		return
+	}
+	safeOut := strings.ReplaceAll(out, "```", "'''")
+	b.editReply(ctx, s, i, fmt.Sprintf("Executed `%s`:\n```\n%s\n```", command, truncateRunes(safeOut, 1800)))
 }
 
 func (b *Bot) cmdStart(s *discordgo.Session, i *discordgo.InteractionCreate, requester string) {

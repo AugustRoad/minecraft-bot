@@ -194,6 +194,7 @@ type Client struct {
 type ServerClient interface {
 	QueryStatus(ctx context.Context, host string) (ServerStatus, error)
 	SendDiscordChat(ctx context.Context, host, author, message string) error
+	ExecCommand(ctx context.Context, host, command string) (string, error)
 	GracefulStop(ctx context.Context, host string) error
 }
 
@@ -215,6 +216,25 @@ func (c *Client) SendDiscordChat(ctx context.Context, host, author, message stri
 	defer rcon.Close()
 	_, err = rcon.Exec(cmd)
 	return err
+}
+
+// ExecCommand executes a single Minecraft server console command over RCON and returns its output.
+func (c *Client) ExecCommand(ctx context.Context, host, command string) (string, error) {
+	clean := sanitizeSingleLine(strings.TrimPrefix(strings.TrimSpace(command), "/"), maxRCONCommandBytes)
+	if clean == "" {
+		return "", errors.New("command cannot be empty")
+	}
+	rcon, err := DialRCON(ctx, host, c.RCONPort, c.RCONPassword)
+	if err != nil {
+		return "", err
+	}
+	defer rcon.Close()
+
+	out, err := rcon.Exec(clean)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stripFormatting(out)), nil
 }
 
 // GracefulStop flushes world chunks to disk and stops the Minecraft server cleanly over RCON.

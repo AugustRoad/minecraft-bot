@@ -364,6 +364,23 @@ func (c *Controller) RelayDiscordChat(ctx context.Context, author, message strin
 	return c.mc.SendDiscordChat(rconCtx, host, author, message)
 }
 
+// RunCommand executes a Minecraft server console command over RCON while the VM is online.
+func (c *Controller) RunCommand(ctx context.Context, command string) (string, error) {
+	c.mu.Lock()
+	phase := c.phase
+	host := c.vmInfo.InternalIP
+	running := c.vmInfo.IsRunning()
+	c.mu.Unlock()
+
+	if !running || phase != PhaseOnline || host == "" {
+		return "", fmt.Errorf("cannot run command while server is %s", phase)
+	}
+
+	rconCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return c.mc.ExecCommand(rconCtx, host, command)
+}
+
 // HandleAgentEvent processes a single structured event from mc-agent sequentially.
 func (c *Controller) HandleAgentEvent(ctx context.Context, ev events.Event) {
 	c.logger.Info("received mc-agent event", "type", ev.Type, "player", ev.Player)

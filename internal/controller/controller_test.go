@@ -89,6 +89,10 @@ func (f *fakeMC) SendDiscordChat(ctx context.Context, host, author, message stri
 	return nil
 }
 
+func (f *fakeMC) ExecCommand(ctx context.Context, host, command string) (string, error) {
+	return "ok: " + command, nil
+}
+
 func (f *fakeMC) GracefulStop(ctx context.Context, host string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
